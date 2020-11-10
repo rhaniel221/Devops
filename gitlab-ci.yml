@@ -1,0 +1,152 @@
+image: docker:latest
+
+variables:
+  DOCKER_DRIVER: overlay2
+  REPOSITORY_URL: ${AWS_ECR_REPOSITORY}
+  REGION: ${AWS_DEFAULT_REGION}
+  TASK_DEFINITION_NAME: ${TASK_DEFINITION_NAME}
+  CLUSTER_NAME: ${CLUSTER_NAME}
+  SERVICE_NAME: ${SERVICE_NAME}
+  VAR_NAME: BUILD_NUMBER
+  TOKEN: ${CI_PIPELINE_IID_TOKEN}
+  GITLAB_URL: "https://gitlab.com"
+  DEV_REPOSITORY_URL: ${DEV_AWS_ECR_REPOSITORY}
+  #PROD
+  PROD_REPOSITORY_URL: ${PROD_AWS_ECR_REPOSITORY}
+  PROD_REGION: ${PROD_AWS_REGION}
+  PROD_CLUSTER_NAME: ${PROD_AWS_CLUSTER_NAME}
+  PROD_RDS_ENDPOINT: ${PROD_AWS_RDS_ENDPOINT}
+  PROD_DBNAME: ${PROD_AWS_RDS_DB_NAME}
+
+services:
+- docker:dind
+
+before_script:
+  - apk add --no-cache curl jq python3 py3-pip
+  - pip install awscli
+  #- $(aws ecr get-login --no-include-email --region "${REGION}")
+  #- IMAGE_TAG="$(echo $CI_COMMIT_SHA | head -c 8)"
+  - apk add --update curl jq
+
+stages:
+  - init
+  - build_hom
+  - deploy_hom
+  - build_prod
+  - approve_prod
+  - deploy_prod
+
+auto_increment:
+  stage: init
+
+  before_script:
+  
+  script:
+  - "VAR=$(curl -s -f  --header \"PRIVATE-TOKEN: ${TOKEN}\" \"${GITLAB_URL}/api/v4/projects/${CI_PROJECT_ID}/variables/${VAR_NAME}\" | jq  -r '.value' ) "
+  - let VAR=VAR+1
+  - "curl -s -f --request PUT --header \"PRIVATE-TOKEN: ${TOKEN}\" \"${GITLAB_URL}/api/v4/projects/${CI_PROJECT_ID}/variables/${VAR_NAME}\" --form \"value=${VAR}\" "
+  - echo ${VAR}
+#Ambiente de Dev e Homolog
+
+build_hom:
+  stage: build_hom
+  environment:
+    name: dev
+  script:
+    - $(aws ecr get-login --no-include-email --region "${REGION}")
+    - export VERSION_NUMBER="0.0."  
+    - echo "Construindo a imagem...em dev hom"
+    - docker build -f Dockerfile -t $REPOSITORY_URL:${VERSION_NUMBER}${BUILD_NUMBER} .
+    - echo "Colocando a Tag..."
+    - docker tag $REPOSITORY_URL:${VERSION_NUMBER}${BUILD_NUMBER} $REPOSITORY_URL:latest
+    - echo "Enviando para o ECR..."
+    - docker push $REPOSITORY_URL:${VERSION_NUMBER}${BUILD_NUMBER}
+    - docker push $REPOSITORY_URL:latest
+  only:
+    - dev
+
+deploy_hom:
+  stage: deploy_hom
+  environment:
+    name: dev
+  script:
+    - ls
+    - $(aws ecr get-login --no-include-email --region "${REGION}")
+    - echo "Iniciando deploy em Dev / Hom"
+    # Configure deploy.json
+    # check aws
+    - aws s3 ls
+    - sed -i -e "s|\"LOGOUTURL\"|\"$LOGOUT_URL\"|" deploy.json
+    - sed -i -e "s|\"BASEURL\"|\"$BASE_URL\"|" deploy.json
+    - sed -i -e "s|\"DBHOST\"|\"$DEVHOM_RDS_ENDPOINT\"|" deploy.json
+    - sed -i -e "s|\"DBNAME\"|\"$DEVHOM_DBNAME\"|" deploy.json
+    - sed -i -e "s|\"REPO\"|\"$DEV_REPOSITORY_URL\"|" deploy.json
+  # TODO
+     # SQS 
+     
+   # Atualizando taskdefinition e o service 
+    - aws ecs register-task-definition --region us-east-1 --cli-input-json file://deploy.json >> temp.json
+    - REV=`grep  '"revision"' temp.json | awk '{print $2}'`
+    - echo $REV
+    - aws ecs update-service --cluster "${CLUSTER_NAME}" --service "${SERVICE_NAME}" --task-definition "${TASK_DEFINTION_NAME}" --region "${REGION}"
+  only:
+   - dev
+
+    
+  
+#A partir desse ponto o environment eh de suma importancia 
+build_prod:
+  stage: build_prod
+  environment:
+    name: production
+  script:
+    - $(aws ecr get-login --no-include-email --region "${PROD_REGION}")
+    - export VERSION_NUMBER="1.0.${VAR}"  
+    - echo "Construindo a imagem...em producao"
+    - docker build -f Dockerfile -t $REPOSITORY_URL:${VERSION_NUMBER}${BUILD_NUMBER} .
+    - echo "Colocando a Tag..."
+    - docker tag $REPOSITORY_URL:${VERSION_NUMBER}${BUILD_NUMBER} $REPOSITORY_URL:latest
+    - echo "Enviando para o ECR..."
+    - docker push $REPOSITORY_URL:${VERSION_NUMBER}${BUILD_NUMBER}
+    - docker push $REPOSITORY_URL:latest
+  only:
+    - master
+
+
+approve_prod:
+  stage: approve_prod
+  script:
+    - echo Aguardando seu clique no Play para lancar o produto!
+  environment:
+    name: production
+    url: https://progerar.agr.br
+  when: manual
+  allow_failure: false 
+  only:
+    - master
+
+deploy_prod:
+  stage: deploy_prod
+  environment:
+    name: production
+  script:
+    - ls
+    - $(aws ecr get-login --no-include-email --region "${PROD_REGION}")
+    - echo "Iniciando deploy em Producao"
+    # Configure deploy.json
+    - aws s3 ls
+    - sed -i -e "s|\"LOGOUTURL\"|\"$LOGOUT_URL\"|" deploy.json
+    - sed -i -e "s|\"BASEURL\"|\"$BASE_URL\"|" deploy.json
+    - sed -i -e "s|\"DBHOST\"|\"$PROD_RDS_ENDPOINT\"|" deploy.json
+    - sed -i -e "s|\"DBNAME\"|\"$PROD_DBNAME\"|" deploy.json
+    - sed -i -e "s|\"REPO\"|\"$PROD_REPOSITORY_URL\"|" deploy.json
+     #TODO
+     #SQS 
+    
+    # Atualizando taskdefinition e o service 
+    - aws ecs register-task-definition --region us-east-1 --cli-input-json file://deploy.json >> temp.json
+    - REV=`grep  '"revision"' temp.json | awk '{print $2}'`
+    - echo $REV
+    - aws ecs update-service --cluster "${PROD_CLUSTER_NAME}" --service "${SERVICE_NAME}" --task-definition "${TASK_DEFINTION_NAME}" --region "${PROD_REGION}"
+  only:
+   - master
